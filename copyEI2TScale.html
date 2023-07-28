@@ -1,0 +1,368 @@
+<html>
+  <body>
+    <div id="webgpu-canvas-container">
+      <div>WebGPU Canvas</div>
+      <canvas id="webgpu-canvas"></canvas>
+    </div>
+    <script type="module">
+      const wgslShaders = {
+        scale : 
+          `
+            struct Uniforms {
+              scale : vec2f
+            };
+
+            struct VertexOutput {
+              @builtin(position) Position : vec4<f32>,
+              @location(0) fragUV : vec2<f32>,
+            }
+
+            @group(0) @binding(0) var mySampler : sampler;
+            @group(0) @binding(1) var myTexture : texture_2d<f32>;
+            @group(0) @binding(2) var<uniform> uniforms : Uniforms;
+
+            @vertex 
+            fn vert_main(
+              @location(0) position : vec2<f32>,
+              @location(1) uv : vec2<f32>
+            ) -> VertexOutput {
+              var output : VertexOutput;
+              output.Position = vec4(position * uniforms.scale, 0.0, 1.0);
+              output.fragUV = uv;
+              return output;
+            }
+
+            @fragment
+            fn frag_main(@location(0) fragUV : vec2<f32>) -> @location(0) vec4<f32> {
+              return textureSample(myTexture, mySampler, fragUV);
+            }
+          `,
+
+          normal : 
+          `
+            struct VertexOutput {
+              @builtin(position) Position : vec4<f32>,
+              @location(0) fragUV : vec2<f32>,
+            }
+
+            @group(0) @binding(0) var mySampler : sampler;
+            @group(0) @binding(1) var myTexture : texture_2d<f32>;
+
+            @vertex 
+            fn vert_main(
+              @location(0) position : vec2<f32>,
+              @location(1) uv : vec2<f32>
+            ) -> VertexOutput {
+              var output : VertexOutput;
+              output.Position = vec4(position, 0.0, 1.0);
+              output.fragUV = uv;
+              return output;
+            }
+
+            @fragment
+            fn frag_main(@location(0) fragUV : vec2<f32>) -> @location(0) vec4<f32> {
+              return textureSample(myTexture, mySampler, fragUV);
+            }
+          `
+      };
+      
+
+      function getArrayForImageVertexBuffer(imageNum, imageRows, imageCols) {
+        // Each image takes 6 vertices (2 triangles). Each vertex has 4 floats.
+        // Therefore, each image needs 24 floats.
+        const rectVerts = new Float32Array(imageNum * 24);
+
+        // Width and height of the image.
+        const maxColRow = Math.max(imageCols, imageRows);
+        let w = 2.0 / maxColRow;
+        let h = 2.0 / maxColRow;
+        for (let row = 0; row < imageRows; ++row) {
+          for (let column = 0; column < imageCols; ++column) {
+            const array_index = (row * imageCols + column) * 24;
+            // X and y of the image.
+            const x = -1.0 + w * column;
+            const y = 1.0 - h * row;
+
+            rectVerts.set([
+              (x + w), y, 1.0, 0.0,
+              (x + w), (y - h), 1.0, 1.0,
+              x, (y - h), 0.0, 1.0,
+              (x + w), y, 1.0, 0.0,
+              x, (y - h), 0.0, 1.0,
+              x, y, 0.0, 0.0,
+            ], array_index);
+          }
+        }
+        return rectVerts;
+      }
+
+      function createVertexBufferForImages(device, imageNum, imageRows, imageCols) {
+        const rectVerts = getArrayForImageVertexBuffer(imageNum, imageRows, imageCols);
+        const verticesBuffer = device.createBuffer({
+          size: rectVerts.byteLength,
+          usage: GPUBufferUsage.VERTEX,
+          mappedAtCreation: true,
+        });
+
+        new Float32Array(verticesBuffer.getMappedRange()).set(rectVerts);
+        verticesBuffer.unmap();
+
+        return verticesBuffer;
+      }
+
+      const parsedString = (function (names) {
+        const pairs = {};
+        for (let i = 0; i < names.length; ++i) {
+          var keyValue = names[i].split('=', 2);
+          if (keyValue.length == 1)
+            pairs[keyValue[0]] = '';
+          else
+            pairs[keyValue[0]] = decodeURIComponent(keyValue[1].replace(/\+/g, ' '));
+        }
+        return pairs;
+      })(window.location.search.substr(1).split('&'));
+
+      var imagesRow = parseInt(parsedString['rows']);
+      if (parsedString['rows'] === undefined) {
+        imagesRow = 1;
+      }
+
+      var imagesCol = parseInt(parsedString['columns']);
+      if (parsedString['columns'] === undefined) {
+        imagesCol = 1;
+      }
+
+      var scale = true;
+      if (parsedString['scale'] === 'none') {
+        scale = false;
+      }
+
+      var measureFrameStart = parseInt(parsedString['measureFrameStart']);
+      if (parsedString['measureFrameStart'] === undefined) {
+        measureFrameStart = 0;
+      }
+
+      var measureFrameCount = parseInt(parsedString['measureFrameCount']);
+      if (parsedString['measureFrameCount'] === undefined) {
+        measureFrameCount = 100;
+      }
+
+      var measureFrameEnd = measureFrameStart + measureFrameCount - 1;
+
+      var canvasWidth = parseInt(parsedString['canvasWidth']);
+      if (parsedString['canvasWidth'] === undefined) {
+        canvasWidth = 1;
+      }
+
+      var canvasHeight = parseInt(parsedString['canvasHeight']);
+      if (parsedString['canvasHeight'] === undefined) {
+        canvasHeight = 1;
+      }
+
+      const imagesNum = imagesRow * imagesCol;
+      const imageTextures = [];
+      const imageBindGroups = [];
+
+
+      const adapter = await navigator.gpu.requestAdapter();
+      const device = await adapter.requestDevice();
+
+      const img = document.createElement('img');
+      img.src = './image.webp';
+      await img.decode();
+
+      const canvas2d = document.createElement('canvas');
+      canvas2d.width = img.width * canvasWidth;
+      canvas2d.height = img.height * canvasHeight;
+      const context2d = canvas2d.getContext('2d');
+
+      for (var i = 0; i < canvasHeight; ++i) {
+        for (var j = 0; j < canvasWidth; ++j) {
+          context2d.drawImage(img, j * img.width, i * img.height);
+        }
+      }
+
+      const canvas = document.getElementById('webgpu-canvas');
+      canvas.width = img.width;
+      canvas.height = img.height;
+
+      const context = canvas.getContext('webgpu');
+      const presentationFormat = navigator.gpu.getPreferredCanvasFormat();
+      context.configure({
+        device,
+        format: presentationFormat,
+        usage: GPUTextureUsage.COPY_DST | GPUTextureUsage.RENDER_ATTACHMENT,
+        alphaMode: 'premultiplied',
+      });
+
+      for (var i = 0; i < imagesNum; ++i) {
+        imageTextures[i] = device.createTexture({
+            size: [canvas2d.width, canvas2d.height, 1],
+            format: 'rgba8unorm',
+            usage:
+              GPUTextureUsage.TEXTURE_BINDING |
+              GPUTextureUsage.COPY_DST |
+              GPUTextureUsage.RENDER_ATTACHMENT,
+        });
+      }
+
+      
+      const uniformBufferSize = 256;
+
+      const uniformBuffer = device.createBuffer({
+        size: uniformBufferSize,
+        usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.UNIFORM,
+      });
+      const candidateScaleFactors = [1.0, 0.8, 0.6, 0.4, 0.2, 0.4, 0.6, 0.8, 1.0];
+
+      const pipeline = device.createRenderPipeline({
+        layout: 'auto',
+        vertex: {
+          module: device.createShaderModule({
+            code: scale? wgslShaders.scale : wgslShaders.normal,
+          }),
+          entryPoint: 'vert_main',
+          buffers: [{
+            arrayStride: 16,
+            attributes: [
+              {
+                // position
+                shaderLocation: 0,
+                offset: 0,
+                format: 'float32x2',
+              },
+              {
+                // uv
+                shaderLocation: 1,
+                offset: 8,
+                format: 'float32x2',
+              }
+            ],
+          }],
+        },
+        fragment: {
+          module: device.createShaderModule({
+            code: scale ? wgslShaders.scale : wgslShaders.normal,
+          }),
+          entryPoint: 'frag_main',
+          targets: [
+            {
+              format: presentationFormat,
+            },
+          ],
+        },
+        primitive: {
+          topology: 'triangle-list',
+        },
+      });
+
+      const sampler = device.createSampler({
+        magFilter: 'linear',
+        minFilter: 'linear',
+      });
+
+      for (var i = 0; i < imagesNum; ++i) {
+        if (scale) {
+          imageBindGroups[i] = device.createBindGroup({
+            layout: pipeline.getBindGroupLayout(0),
+            entries: [
+              {
+                binding: 0,
+                resource: sampler,
+              },
+              {
+                binding: 1,
+                resource: imageTextures[i].createView(),
+              },
+              {
+                binding: 2,
+                resource: {buffer: uniformBuffer},
+              },
+            ],
+          });
+        } else {
+          imageBindGroups[i] = device.createBindGroup({
+            layout: pipeline.getBindGroupLayout(0),
+            entries: [
+              {
+                binding: 0,
+                resource: sampler,
+              },
+              {
+                binding: 1,
+                resource: imageTextures[i].createView(),
+              },
+            ],
+          });
+        }
+      }
+
+      const vertexBuffer = createVertexBufferForImages(device, imagesNum, imagesRow, imagesCol);
+
+      const renderPassDescriptor = {
+        colorAttachments: [
+          {
+            view: undefined, // Assigned later
+
+            clearValue: { r: 0.5, g: 0.5, b: 0.5, a: 1.0 },
+            loadOp: 'clear',
+            storeOp: 'store',
+          },
+        ],
+      };
+
+      var frameIndex = 0;
+      var start = 0;
+      var time = 0;
+      var scaleFactorIndex = 0;
+      var data = new Float32Array(2);
+
+      async function frame() {
+        if (frameIndex == measureFrameStart) {
+          start = performance.now();
+        }
+        for (var i = 0; i < imagesNum; ++i) {
+          device.queue.copyExternalImageToTexture(
+            { source: canvas2d },
+            { texture: imageTextures[i] },
+            [canvas2d.width, canvas2d.height]
+          );
+        }
+        
+        if (scale) {
+          scaleFactorIndex = frameIndex % candidateScaleFactors.length;
+          data[0] = candidateScaleFactors[scaleFactorIndex];
+          data[1] = data[0];
+          device.queue.writeBuffer(uniformBuffer, 0, data);
+        }
+        
+        renderPassDescriptor.colorAttachments[0].view =
+          context.getCurrentTexture().createView();
+
+        const commandEncoder = device.createCommandEncoder();
+        const passEncoder = commandEncoder.beginRenderPass(renderPassDescriptor);
+        passEncoder.setPipeline(pipeline);
+        passEncoder.setVertexBuffer(0, vertexBuffer);
+
+        for (var i = 0; i < imagesNum; ++i) {
+          passEncoder.setBindGroup(0, imageBindGroups[i]);
+          passEncoder.draw(6, 1, i * 6, 0);
+        }
+        passEncoder.end();
+
+        device.queue.submit([commandEncoder.finish()]);
+
+        if (frameIndex == measureFrameEnd ) {
+          await device.queue.onSubmittedWorkDone();
+          time = performance.now() - start;
+          console.log("copyEI2T time of", measureFrameCount, " frames from frame", measureFrameStart, " is : ", time);
+          console.log("average frame time is : " , time / measureFrameCount);
+        }
+        frameIndex++;
+
+        requestAnimationFrame(frame);
+      }
+      requestAnimationFrame(frame);
+    </script>
+  </body>
+</html>
